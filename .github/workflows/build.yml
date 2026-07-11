@@ -1,0 +1,42 @@
+﻿name: Generate Playlist
+on:
+  push:
+    branches: [main]
+    paths: ['songs/**']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate index.json
+        run: |
+          cd songs
+          python3 -c "
+          import json, os, glob
+          BASE_URL = 'https://fcylz.github.io/cy-music/songs'
+          songs = []
+          for mp3_file in sorted(glob.glob('*.mp3')):
+              name = os.path.splitext(mp3_file)[0]
+              lrc_file = name + '.lrc'
+              entry = {
+                  'name': name,
+                  'mp3': f'{BASE_URL}/{mp3_file}',
+              }
+              if os.path.exists(lrc_file):
+                  entry['lrc'] = f'{BASE_URL}/{lrc_file}'
+              songs.append(entry)
+          json.dump(songs, open('../index.json', 'w'), ensure_ascii=False, indent=2)
+          print(f'Generated playlist with {len(songs)} songs')
+          "
+      - name: Commit index.json
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add index.json
+          git diff --cached --quiet || git commit -m 'auto: update playlist index'
+          git push
+
+
