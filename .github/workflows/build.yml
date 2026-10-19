@@ -1,42 +1,38 @@
-﻿name: Generate Playlist
+name: Generate Playlist
+
 on:
   push:
     branches: [main]
-    paths: ['songs/**']
+    paths:
+      - 'songs/**'
+      - 'tools/update_playlist.py'
   workflow_dispatch:
+
 permissions:
   contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Generate index.json
-        run: |
-          cd songs
-          python3 -c "
-          import json, os, glob
-          BASE_URL = 'https://fcylz.github.io/cy-music/songs'
-          songs = []
-          for mp3_file in sorted(glob.glob('*.mp3')):
-              name = os.path.splitext(mp3_file)[0]
-              lrc_file = name + '.lrc'
-              entry = {
-                  'name': name,
-                  'mp3': f'{BASE_URL}/{mp3_file}',
-              }
-              if os.path.exists(lrc_file):
-                  entry['lrc'] = f'{BASE_URL}/{lrc_file}'
-              songs.append(entry)
-          json.dump(songs, open('../index.json', 'w'), ensure_ascii=False, indent=2)
-          print(f'Generated playlist with {len(songs)} songs')
-          "
-      - name: Commit index.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 只报告，不改名：CI 里让 bot 改文件名风险太高，改名的决定留给人
+      - name: 检查歌词配对情况
+        run: python tools/match_lyrics.py --dry-run || true
+
+      # 一次扫描，同时产出 index.json 与 歌单.txt，保证两者永远一致
+      - name: 生成 index.json 与 歌单.txt
+        run: python tools/update_playlist.py
+
+      - name: Commit
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git add index.json
+          git add index.json 歌单.txt
           git diff --cached --quiet || git commit -m 'auto: update playlist index'
           git push
-
-
