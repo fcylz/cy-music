@@ -29,10 +29,16 @@ cy-music MP3 ↔ LRC 自动配对
     python tools/match_lyrics.py --dry-run       # 只出报告，不动文件（CI 用这个）
     python tools/match_lyrics.py --yes           # 跳过确认（自动化）
     python tools/match_lyrics.py --report out.txt   # 报告另存一份
+    python tools/match_lyrics.py --collect       # songs/ 之外的音频和歌词全部收进来
+
+`--collect` 是另一码事：它只负责**搬运**，把 songs/ 之外（含子目录）的所有
+mp3/lrc 一律搬进 songs/，命名规范成 `歌名-歌手`。配对只决定歌词叫什么名字，
+不决定要不要搬——配不上的孤立歌词照样搬，避免继续散落在仓库根目录。
 
 安全策略
 --------
-* 一律以音频文件名为准，只改歌词名，绝不改音频名。
+* 配对改名阶段一律以音频文件名为准，只改歌词名，绝不改音频名。
+* `--collect` 搬音频时会规范化文件名（`歌 - 手.mp3` → `歌-手.mp3`），不改内容。
 * 目标已存在 → 报冲突，跳过，不覆盖。
 * 目标名含 Windows 非法字符 → 跳过，不擅自清洗。
 * 有动作时写 `配对日志.txt`，记录旧名→新名和配对依据。
@@ -287,11 +293,31 @@ def canonical_stem(stem: str) -> str:
     return f"{title}-{singer}"
 
 
+def standalone_lyric_stem(lyric: Path, inside: list, threshold: float):
+    """孤立歌词该叫什么：优先跟随 songs/ 里已存在的音频，否则用自身文件名。
+
+    典型场景：音频已经在 songs/，歌词被丢在仓库根目录，名字还是 `歌名 - 歌手.lrc`。
+    这时应该跟着音频叫，而不是自成一套。
+    """
+    best = None
+    for audio in inside:
+        result = score_pair(lyric, audio, threshold)
+        if result and (best is None or result[0] < best[0]):
+            best = (result[0], result[1], result[2], audio)
+    if best and best[0] <= 3:                     # L1–L3 才跟随，模糊的不跟
+        _, layer, _, audio = best
+        return audio.stem, f"{LAYER_NAMES[layer]}，跟随 songs/ 里的 {audio.name}"
+    stem = canonical_stem(lyric.stem)
+    if best:
+        return stem, f"与 {best[3].name} 相似度偏低，按自身名字搬，请复核"
+    return stem, "无对应音频"
+
+
 def plan_collect(source: Path, target_dir: Path, threshold: float = FUZZY_THRESHOLD):
-    """在 source 里找散落的音频/歌词，规划把它们归位到 target_dir。
+    """规划归位：源目录（含子目录）里的音频和歌词，一律搬进 target_dir。
 
     网页上传很容易把文件扔在仓库根目录，命名也常常是 `歌名 - 歌手`（带空格）。
-    这一步负责收回来并统一命名。
+    这里逐个文件搬，配对只用来决定歌词该叫什么名字，不用来决定要不要搬。
     """
     target_res = target_dir.resolve()
     audios_by_dir, lyrics_by_dir = defaultdict(list), defaultdict(list)
@@ -312,15 +338,36 @@ def plan_collect(source: Path, target_dir: Path, threshold: float = FUZZY_THRESH
         elif suffix in LYRIC_EXTS:
             lyrics_by_dir[path.parent].append(path)
 
-    moves = []        # (audio, lyric|None, target_stem, layer, note)
-    fuzzy = []        # (audio|lyric, 说明)
-    leftover = []     # 没找到音频的散落歌词
-    conflicts = []    # (audio, target_stem, 原因)
+    inside = sorted(p for p in target_dir.rglob("*")
+                    if p.is_file() and p.suffix.lower() in AUDIO_EXTS)
 
-    for directory, audios in audios_by_dir.items():
-        pool = lyrics_by_dir.get(directory, [])
+    moves = []        # (src, target_stem, kind, note) —— 逐个文件，音频歌词各自独立
+    notes = []        # (src, 说明) 已归位但值得复核
+    conflicts = []    # (src, target_stem, 原因)
+    planned = {}      # 目标文件名 -> 源文件，防本次运行内撞名
+
+    def add(src: Path, stem: str, kind: str, note: str) -> None:
+        name = stem + src.suffix.lower()
+        if not stem.strip():
+            conflicts.append((src, stem, "规范化后文件名为空，未搬"))
+            return
+        if name in planned:
+            conflicts.append((src, stem, f"与本次归位的 {planned[name].name} 同名，未搬"))
+            return
+        if (target_dir / name).exists():
+            conflicts.append((src, stem, f"{name} 已在 songs/ 中，不覆盖"))
+            return
+        planned[name] = src
+        moves.append((src, stem, kind, note))
+
+    for directory in sorted(set(audios_by_dir) | set(lyrics_by_dir), key=str):
+        audios = sorted(audios_by_dir.get(directory, []))
+        pool = sorted(lyrics_by_dir.get(directory, []))
         used = set()
+
         for audio in audios:
+            stem = canonical_stem(audio.stem)
+            note = "无歌词"
             scored = []
             for lyric in pool:
                 if lyric in used:
@@ -328,62 +375,51 @@ def plan_collect(source: Path, target_dir: Path, threshold: float = FUZZY_THRESH
                 result = score_pair(lyric, audio, threshold)
                 if result:
                     scored.append((result[0], result[1], result[2], lyric))
-            if not scored:
-                moves.append((audio, None, canonical_stem(audio.stem), "-", "无歌词"))
-                continue
-
             scored.sort(key=lambda item: item[0])
-            top_rank = scored[0][0]
-            top = [item for item in scored if item[0] == top_rank]
-            if len(top) > 1:
-                names = "、".join(item[3].name for item in top)
-                fuzzy.append((audio, f"同时匹配多个歌词：{names}，未归位"))
-                used.update(item[3] for item in top)
-                continue
 
-            _, layer, note, lyric = top[0]
-            used.add(lyric)
-            if layer == "L4":                    # 模糊匹配不搬，等人工确认
-                fuzzy.append((lyric, f"与 {audio.name} {note}，未归位"))
-                continue
-            moves.append((audio, lyric, canonical_stem(audio.stem), layer, note))
+            if scored:
+                top_rank = scored[0][0]
+                top = [item for item in scored if item[0] == top_rank]
+                if len(top) > 1:
+                    names = "、".join(item[3].name for item in top)
+                    notes.append((audio, f"同时匹配多个歌词（{names}），歌词未跟随，按自身名字搬"))
+                else:
+                    _, layer, layer_note, lyric = top[0]
+                    used.add(lyric)
+                    add(lyric, stem, "lyric", f"{LAYER_NAMES[layer]}，跟随音频")
+                    note = LAYER_NAMES[layer]
+                    if layer == "L4":
+                        notes.append((lyric, f"与 {audio.name} 仅{layer_note}，请复核"))
+            add(audio, stem, "audio", note)
 
+        # 本目录里剩下的歌词：音频没有、或音频在别处
         for lyric in pool:
-            if lyric not in used:
-                leftover.append(lyric)
+            if lyric in used:
+                continue
+            stem, note = standalone_lyric_stem(lyric, inside, threshold)
+            add(lyric, stem, "lyric", note)
 
-    kept = []
-    for audio, lyric, stem, layer, note in moves:
-        target = target_dir / (stem + audio.suffix.lower())
-        if target.exists():
-            conflicts.append((audio, stem, f"{target.name} 已在 songs/ 中，不覆盖"))
-        else:
-            kept.append((audio, lyric, stem, layer, note))
-
-    kept.sort(key=lambda item: item[0].name)
+    moves.sort(key=lambda item: (item[2], item[0].name))
     return {
-        "moves": kept,
-        "fuzzy": fuzzy,
-        "leftover": leftover,
+        "moves": moves,
+        "notes": notes,
         "conflicts": conflicts,
         "audio_count": sum(len(v) for v in audios_by_dir.values()),
+        "lyric_count": sum(len(v) for v in lyrics_by_dir.values()),
     }
 
 
 def apply_collect(moves: list, target_dir: Path):
-    """执行归位。音频和它的歌词一起搬，命名统一。"""
+    """执行归位：逐个文件搬，音频与歌词各自独立，一个失败不影响其他。"""
     done, failed = [], []
     target_dir.mkdir(parents=True, exist_ok=True)
-    for audio, lyric, stem, layer, note in moves:
-        new_audio = target_dir / (stem + audio.suffix.lower())
-        new_lyric = target_dir / (stem + lyric.suffix.lower()) if lyric is not None else None
+    for src, stem, kind, note in moves:
+        dst = target_dir / (stem + src.suffix.lower())
         try:
-            shutil.move(str(audio), str(new_audio))
-            if lyric is not None:
-                shutil.move(str(lyric), str(new_lyric))
-            done.append((audio, new_audio, lyric, new_lyric, layer, note))
+            shutil.move(str(src), str(dst))
+            done.append((src, dst, kind, note))
         except OSError as exc:
-            failed.append((audio, new_audio, str(exc)))
+            failed.append((src, dst, str(exc)))
     return done, failed
 
 
@@ -461,25 +497,26 @@ def write_log(path: Path, report: dict, done: list, failed: list) -> None:
 # --------------------------------------------------------------------------
 
 def format_collect(report: dict, applied: bool) -> str:
-    lines = [f"归位扫描：散落音频 {report['audio_count']} 个"]
-    if not report["audio_count"] and not report["leftover"]:
+    audio_n, lyric_n = report["audio_count"], report["lyric_count"]
+    if not (audio_n or lyric_n):
         return ""
 
+    lines = [f"归位扫描：songs/ 之外 音频 {audio_n} 个，歌词 {lyric_n} 个"]
+    title = "已归位" if applied else "待归位（一律搬进 songs/）"
     sections = [
-        ("已归位" if applied else "待归位（散落文件 → songs/）", [
-            f"{audio.name}"
-            + (f"  +  {lyric.name}" if lyric is not None else "  （无歌词）")
-            + f"  ->  {stem}{audio.suffix.lower()}   ({layer} {LAYER_NAMES.get(layer, note)})"
-            for audio, lyric, stem, layer, note in report["moves"]
+        (title, [
+            f"{src.name}  ->  {stem}{src.suffix.lower()}"
+            + ("   [音频] " if kind == "audio" else "   [歌词] ")
+            + note
+            for src, stem, kind, note in report["moves"]
         ]),
-        ("冲突（songs/ 里已有同名，未搬）", [
-            f"{audio.name}  ->  {stem}{audio.suffix.lower()}   {reason}"
-            for audio, stem, reason in report["conflicts"]
+        ("冲突（songs/ 已有同名，未搬）", [
+            f"{src.name}  ->  {stem}{src.suffix.lower()}   {reason}"
+            for src, stem, reason in report["conflicts"]
         ]),
-        ("模糊/歧义（未归位，需人工确认）", [
-            f"{target.name}: {note}" for target, note in report["fuzzy"]
+        ("需要复核（已归位，但配对不确定）", [
+            f"{src.name}: {note}" for src, note in report["notes"]
         ]),
-        ("孤立歌词（没找到对应音频，留在原地）", [lyric.name for lyric in report["leftover"]]),
     ]
     for title, items in sections:
         if not items:
@@ -585,9 +622,9 @@ def main(argv=None) -> int:
             if args.yes or ask_confirm(len(collect_report["moves"])):
                 moved, collect_failed = apply_collect(collect_report["moves"], songs_dir)
                 if moved:
-                    print(f"\n✅ 已归位 {len(moved)} 组到 {songs_dir.name}/")
-                for audio, target, error in collect_failed:
-                    print(f"⚠️  跳过 {audio.name}: {error}")
+                    print(f"\n✅ 已归位 {len(moved)} 个文件到 {songs_dir.name}/")
+                for src, target, error in collect_failed:
+                    print(f"⚠️  跳过 {src.name}: {error}")
             # 归位后重新扫描，后面的配对才能看到新文件
             print()
 
@@ -626,9 +663,7 @@ def main(argv=None) -> int:
     unresolved = bool(report["fuzzy"] or report["ambiguous"] or report["orphans"]
                       or report["conflicts"] or failed or collect_failed)
     if collect_report is not None:
-        unresolved = unresolved or bool(collect_report["fuzzy"]
-                                       or collect_report["leftover"]
-                                       or collect_report["conflicts"])
+        unresolved = unresolved or bool(collect_report["conflicts"] or collect_failed)
     return 1 if unresolved else 0
 
 
